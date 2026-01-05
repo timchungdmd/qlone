@@ -2,50 +2,79 @@ import ARKit
 import SceneKit
 import Foundation
 import UIKit
+import AVFoundation
+import CoreVideo // Required for CMCopyDictionaryOfAttachments
 
 extension ARScanManager {
     
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         guard isRunning else { return }
         
-        // 1. Determine "Should Save" based on Active Camera
+        // 1. Check Capture Conditions
         let shouldSave: Bool
-        
         if captureMode == .manual {
             shouldSave = pendingManualCapture
         } else {
-            // AUTO MODE LOGIC
+            // Auto Mode: Throttle (0.6s)
             let now = Date().timeIntervalSince1970
-            let timeElapsed = (now - lastCaptureTimestamp) > 0.6 // 0.6s interval
+            let timeElapsed = (now - lastCaptureTimestamp) > 0.6
             
             if useFrontCamera {
-                // --- SELFIE LOGIC (Requires Face) ---
                 let isFaceVisible = frame.anchors.contains(where: { $0 is ARFaceAnchor })
                 shouldSave = timeElapsed && isFaceVisible
-                
                 if !isFaceVisible { statusText = "Find Face..." }
-                
             } else {
-                // --- REAR LOGIC (Always Capture if time elapsed) ---
                 shouldSave = timeElapsed
             }
         }
         
-        // 2. Save
+        // 2. Capture
         if shouldSave {
-            // Convert to UIImage (Handles orientation)
-            if let imageToSave = self.createUIImage(from: frame) {
-                
-                Task {
-                    await imageWriter.write(image: imageToSave, state: captureState)
+            let colorBuffer = frame.capturedImage
+            
+            // EXTRACT METADATA (Gravity, Intrinsics)
+            // This retrieves the hidden "Apple Maker Notes" needed to fix "Sample not registered"
+            let metadata = CMCopyDictionaryOfAttachments(
+                allocator: kCFAllocatorDefault,
+                target: colorBuffer,
+                attachmentMode: kCMAttachmentMode_ShouldPropagate
+            ) as? [String: Any]
+            
+            // PREPARE DEPTH (Unified)
+            var rawDepth: CVPixelBuffer? = nil
+            
+            if useFrontCamera {
+                // Front: Convert Disparity (Inverse) -> Linear Depth (Float32)
+                if let depthData = frame.capturedDepthData {
+                    let converted = depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
+                    rawDepth = converted.depthDataMap
                 }
-                
-                frameCountForState += 1
-                lastCaptureTimestamp = Date().timeIntervalSince1970
-                
-                statusText = pendingManualCapture ? "Captured!" : "Scanning (\(frameCountForState))"
-                if pendingManualCapture { pendingManualCapture = false }
+            } else {
+                // Rear: LiDAR SceneDepth is already Linear Depth
+                rawDepth = frame.sceneDepth?.depthMap
             }
+            
+            // Save to Disk
+            Task {
+                await imageWriter.write(
+                    colorBuffer: colorBuffer,
+                    metadata: metadata,
+                    rawDepthBuffer: rawDepth,
+                    state: captureState
+                )
+            }
+            
+            // UI Feedback
+            frameCountForState += 1
+            lastCaptureTimestamp = Date().timeIntervalSince1970
+            statusText = pendingManualCapture ? "Captured!" : "Scanning (\(frameCountForState))"
+            
+            // Thumbnail
+            if frameCountForState % 5 == 0 {
+                self.updatePreviewThumbnail(from: colorBuffer)
+            }
+            
+            if pendingManualCapture { pendingManualCapture = false }
         }
     }
     
@@ -53,15 +82,13 @@ extension ARScanManager {
         pendingManualCapture = true
     }
     
-    // Helper: Correct Orientation
-    private func createUIImage(from frame: ARFrame) -> UIImage? {
-        let pixelBuffer = frame.capturedImage
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+    private func updatePreviewThumbnail(from buffer: CVPixelBuffer) {
+        let ciImage = CIImage(cvPixelBuffer: buffer)
         let context = CIContext(options: nil)
-        
-        guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else { return nil }
-        
-        // Use .right for both (Standard Portrait behavior for ARKit buffers)
-        return UIImage(cgImage: cgImage, scale: 1.0, orientation: .right)
+        if let cgImage = context.createCGImage(ciImage, from: ciImage.extent) {
+            DispatchQueue.main.async {
+                self.lastTextureImage = UIImage(cgImage: cgImage, scale: 1.0, orientation: .right)
+            }
+        }
     }
 }

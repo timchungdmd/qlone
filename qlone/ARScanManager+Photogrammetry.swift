@@ -13,14 +13,14 @@ extension ARScanManager {
         Task {
             let captureFolder = await imageWriter.sessionFolder(state: captureState)
             
-            // 1. Find JPEGs
-            let allImages = (try? fm.contentsOfDirectory(at: captureFolder, includingPropertiesForKeys: nil))?
-                .filter { $0.pathExtension.lowercased() == "jpg" } ?? []
+            // 1. Find HEIC images (Changed from JPG)
+            let allFiles = (try? fm.contentsOfDirectory(at: captureFolder, includingPropertiesForKeys: nil)) ?? []
+            let imageFiles = allFiles.filter { $0.pathExtension.lowercased() == "heic" }
             
-            // Need at least 20 images
-            guard allImages.count >= 20 else {
+            // Check minimum count (10+)
+            guard imageFiles.count >= 10 else {
                 await MainActor.run {
-                    self.highDetailStatus = "Need more photos (20+)"
+                    self.highDetailStatus = "Need more photos (10+)"
                     self.statusText = self.highDetailStatus
                 }
                 return
@@ -37,20 +37,32 @@ extension ARScanManager {
                 self.statusText = self.highDetailStatus
             }
             
-            // 3. Copy Images (Sanitize names for safety)
-            // Sort by filename (timestamp)
-            let sorted = allImages.sorted { $0.lastPathComponent < $1.lastPathComponent }
+            // 3. Copy Images & Depth Files
+            let sortedImages = imageFiles.sorted { $0.lastPathComponent < $1.lastPathComponent }
             
             // Limit to 150 to prevent memory crashes
             let maxCount = 150
-            let selection = sorted.count > maxCount ? Array(sorted.prefix(maxCount)) : sorted
+            let selection = sortedImages.count > maxCount ? Array(sortedImages.prefix(maxCount)) : sortedImages
             
             for (i, url) in selection.enumerated() {
-                let dest = inputFolder.appendingPathComponent("img_\(String(format: "%04d", i)).jpg")
-                try? fm.copyItem(at: url, to: dest)
+                // Standardize name: img_0000.heic
+                let newBaseName = "img_\(String(format: "%04d", i))"
+                
+                // Copy Color
+                let destImage = inputFolder.appendingPathComponent("\(newBaseName).heic")
+                try? fm.copyItem(at: url, to: destImage)
+                
+                // Copy Depth TIFF (Check for matching depth file)
+                let originalBase = url.deletingPathExtension().lastPathComponent
+                let originalDepth = captureFolder.appendingPathComponent("\(originalBase)_depth.tiff")
+                
+                if fm.fileExists(atPath: originalDepth.path) {
+                    let destDepth = inputFolder.appendingPathComponent("\(newBaseName)_depth.tiff")
+                    try? fm.copyItem(at: originalDepth, to: destDepth)
+                }
             }
             
-            // 4. Run Session
+            // 4. Run Photogrammetry
             let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
             let outputURL = docs.appendingPathComponent("final_model.usdz")
             try? fm.removeItem(at: outputURL)
@@ -61,13 +73,13 @@ extension ARScanManager {
             
             do {
                 var config = PhotogrammetrySession.Configuration()
+                // Disable object masking to utilize the full depth data
                 config.isObjectMaskingEnabled = false
                 config.sampleOrdering = .unordered
-                config.featureSensitivity = .normal
+                config.featureSensitivity = .high
                 
                 let session = try PhotogrammetrySession(input: inputFolder, configuration: config)
-                
-                // FIX: Use .reduced instead of .preview for compatibility
+                // Use .reduced for faster on-device processing stability
                 let request = PhotogrammetrySession.Request.modelFile(url: outputURL, detail: .reduced)
                 
                 try session.process(requests: [request])
@@ -83,7 +95,6 @@ extension ARScanManager {
                             await MainActor.run {
                                 do {
                                     let scene = try SCNScene(url: url, options: nil)
-                                    // Use your cleanup logic
                                     self.cleanupHighDetailScene(scene)
                                     self.highDetailModelURL = url
                                     self.highDetailStatus = "Done!"
@@ -96,6 +107,9 @@ extension ARScanManager {
                         }
                     case .requestError(_, let error):
                         print("PG Error: \(error)")
+                        await MainActor.run {
+                            self.highDetailStatus = "Error: \(error.localizedDescription)"
+                        }
                     default: break
                     }
                 }

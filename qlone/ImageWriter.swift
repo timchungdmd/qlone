@@ -1,11 +1,16 @@
 import Foundation
 import UIKit
+import CoreImage
+import AVFoundation
+import ImageIO
+import UniformTypeIdentifiers
+import VideoToolbox // Essential for fast CGImage conversion
 
-/// Handles writing images to disk.
-/// ADOPTED FROM ORIGINAL: Writes JPEGs to ensure correct orientation and compatibility.
+/// Handles writing HEIC images and Depth data with Metadata.
 actor ImageWriter {
     
     private let fm = FileManager.default
+    private let context = CIContext(options: [.cacheIntermediates: false])
     
     // MARK: - Paths
     
@@ -37,7 +42,6 @@ actor ImageWriter {
     
     func clearSessionFolder(state: CaptureState) {
         let folder = sessionFolder(state: state)
-        // Remove content, keep folder
         if let files = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) {
             for file in files {
                 try? fm.removeItem(at: file)
@@ -45,25 +49,63 @@ actor ImageWriter {
         }
     }
     
-    // MARK: - Writing Logic (JPEG)
+    // MARK: - Writing Logic
     
-    /// Writes a UIImage as high-quality JPEG (0.95).
-    /// This fixes the rotation/metadata bugs found in HEIC.
-    func write(image: UIImage, state: CaptureState) {
+    /// Writes image and depth data to disk, preserving ARKit Metadata.
+    func write(colorBuffer: CVPixelBuffer,
+               metadata: [String: Any]?,
+               rawDepthBuffer: CVPixelBuffer?,
+               state: CaptureState) {
+        
         let folder = sessionFolder(state: state)
-        
-        // Simple timestamp-based name
         let timestamp = Int(Date().timeIntervalSince1970 * 1000)
-        let filename = "img_\(timestamp).jpg"
-        let url = folder.appendingPathComponent(filename)
+        let baseFilename = "img_\(timestamp)"
         
-        // 0.95 quality is excellent for photogrammetry
-        guard let data = image.jpegData(compressionQuality: 0.95) else { return }
+        let imageURL = folder.appendingPathComponent("\(baseFilename).heic")
         
-        do {
-            try data.write(to: url, options: [.atomic])
-        } catch {
-            print("ImageWriter Error: \(error)")
+        // 1. PREPARE METADATA (Critical for Gravity/Orientation)
+        var finalMetadata = metadata ?? [:]
+        // Force Orientation 6 (Right) because ARKit buffers are landscape
+        finalMetadata[kCGImagePropertyOrientation as String] = 6
+        
+        // 2. WRITE HEIC (Color + Metadata)
+        // Use VideoToolbox for efficient CVPixelBuffer -> CGImage conversion
+        var cgImage: CGImage?
+        VTCreateCGImageFromCVPixelBuffer(colorBuffer, options: nil, imageOut: &cgImage)
+        
+        if let image = cgImage {
+            if let dest = CGImageDestinationCreateWithURL(imageURL as CFURL, UTType.heic.identifier as CFString, 1, nil) {
+                // This injects the Gravity Vector and Orientation
+                CGImageDestinationAddImage(dest, image, finalMetadata as CFDictionary)
+                if !CGImageDestinationFinalize(dest) {
+                    print("❌ Failed to finalize HEIC")
+                }
+            }
+        }
+        
+        // 3. WRITE DEPTH TIFF (If available)
+        if let depthMap = rawDepthBuffer {
+            let depthURL = folder.appendingPathComponent("\(baseFilename)_depth.tiff")
+            
+            // Apply Orientation 6 to Depth so it aligns with Color
+            let depthImage = CIImage(cvPixelBuffer: depthMap)
+                .settingProperties([kCGImagePropertyOrientation as String : 6])
+            
+            do {
+                // Use Linear Gray for accurate 16-bit depth values
+                // Safe fallback for ColorSpace
+                let depthColorSpace = CGColorSpace(name: CGColorSpace.linearGray) ?? CGColorSpace(name: CGColorSpace.genericGrayGamma2_2)!
+                
+                try context.writeTIFFRepresentation(
+                    of: depthImage,
+                    to: depthURL,
+                    format: .L16, // 16-bit Grayscale
+                    colorSpace: depthColorSpace,
+                    options: [:]
+                )
+            } catch {
+                print("❌ Write Error (Depth TIFF): \(error)")
+            }
         }
     }
 }
