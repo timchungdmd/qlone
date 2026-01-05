@@ -2,15 +2,11 @@ import SwiftUI
 
 @main
 struct DentalFaceScanApp: App {
-    @StateObject private var scanManager = ARScanManager()
-
     var body: some Scene {
         WindowGroup {
-            if #available(iOS 17.0, *) {
-                ContentView(scanManager: scanManager)
-            } else {
-                Text("Requires iOS 17 or later")
-            }
+            // FIX: No arguments needed here anymore.
+            // ContentView creates its own ARScanManager.
+            ContentView()
         }
     }
 }

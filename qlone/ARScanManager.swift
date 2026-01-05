@@ -1,273 +1,154 @@
-// ARScanManager.swift
-
 import Foundation
 import ARKit
-import UIKit
-import CoreImage
-import Combine
-import simd
 import SceneKit
-import RealityKit
-import ModelIO
-import SceneKit.ModelIO
-import AVFoundation
 import SwiftUI
-
-enum CaptureMode {
-    case auto
-    case manual
-}
+import Combine
 
 @MainActor
-final class ARScanManager: NSObject, ObservableObject, ARSessionDelegate {
+class ARScanManager: NSObject, ObservableObject, ARSessionDelegate {
     
-    // MARK: - Published UI State
-    
-    @Published var captureMode: CaptureMode = .auto
-    
-    @Published var planningMode: PlanningMode = .esthetic
-    @Published var captureState: CaptureState = .repose
-    @Published var previewMode: PreviewMode = .pointCloud
-    
-    @Published var isRunning: Bool = false
-    @Published var statusText: String = "Ready"
-    
-    @Published var previewScene: SCNScene?
-    @Published var previewGeometry: SCNGeometry?
-    
-    @Published var azimuthProgress: Float = 0
-    @Published var elevationProgress: Float = 0
-    
-    @Published var qualityScore: Float = 0
-    @Published var mouthQualityScore: Float = 0
-    @Published var frameCountForState: Int = 0
-    
-    @Published var highDetailStatus: String = ""
-    @Published var isHighDetailReconstructing: Bool = false
-    
-    @Published var isTorchOn: Bool = false
-    @Published var arVideoResolution: ARVideoResolutionPreset = .res4k {
-        didSet {
-            // Live update while session is running
-            guard isRunning,
-                  let current = session.configuration as? ARWorldTrackingConfiguration
-            else { return }
-            
-            let config = current
-            applyVideoResolutionPreset(arVideoResolution, to: config)
-            session.run(config, options: [])        // re-run with new format
-            statusText = "Resolution: \(arVideoResolution.label)"
-        }
-    }
-
-    // Add these two:
-    var currentPhotogrammetryTask: Task<Void, Never>?
-    var currentPhotogrammetrySession: PhotogrammetrySession?
-
-    // MARK: - Core Engine
-    
+    // --- AR Session ---
     let session = ARSession()
     let imageWriter = ImageWriter()
-    let reconstruction = ReconstructionPipeline()
-    let mouthDetector = MouthDetector()
-    let qualityEvaluator = QualityEvaluator()
     
-    /// Raw feature points in reference-camera space (global envelope)
-    var rawPointsByState: [CaptureState: [SIMD3<Float>]] = [:]
+    // --- State ---
+    @Published var statusText: String = "Ready"
+    @Published var isRunning: Bool = false
     
-    /// Head-gated points in reference-camera space (denser in head region)
-    var facePointsByState: [CaptureState: [SIMD3<Float>]] = [:]
+    // Camera Toggle (Default: False = Rear Camera)
+    @Published var useFrontCamera: Bool = false
     
-    var lastTextureImage: UIImage?
-    var highDetailModelURL: URL?
+    // Capture State
+    @Published var captureState: CaptureState = .smile
+    @Published var captureMode: CaptureMode = .auto
     
-    // Face lock + reference camera frame
-    var faceLockAcquired: Bool = false
-    var consecutiveFaceHits: Int = 0
-    var referenceCameraTransform: simd_float4x4?
-    var referenceCameraInverse: simd_float4x4?
+    @Published var frameCountForState: Int = 0
+    @Published var lastCaptureTimestamp: TimeInterval = 0
+    @Published var pendingManualCapture: Bool = false
     
-    /// Last Vision detection (used both for streaming & manual crops)
-    var lastDetection: FaceAndMouthDetection?
+    // Visuals & Preview
+    @Published var previewScene: SCNScene?
+    @Published var referenceCameraTransform: matrix_float4x4?
+    @Published var isHighDetailReconstructing: Bool = false
+    @Published var highDetailStatus: String = ""
+    @Published var highDetailModelURL: URL?
     
-    /// Time of last still capture written for photogrammetry
-    var lastCaptureTimestamp: TimeInterval = 0
+    // --- RESTORED MISSING VARIABLE ---
+    @Published var lastTextureImage: UIImage?
+    @Published var previewMode: String = "Mesh" // Often used by preview logic
     
-    /// When true, the next AR frame will be forced to save as a still
-    var pendingManualCapture: Bool = false
-    // MARK: - Coverage meter internal state
+    // Coverage Tracking
+    @Published var referenceCameraInverse: matrix_float4x4?
+    @Published var coverageBins: Set<String> = []
+    @Published var azimuthProgress: Float = 0.0
+    @Published var elevationProgress: Float = 0.0
+    @Published var didAutoStopOnCoverage: Bool = false
+    @Published var targetFrameCount: Int = 150
+    @Published var previewGeometry: ARSCNFaceGeometry?
+    @Published var facePointsByState: [CaptureState: [SIMD3<Float>]] = [:]
+    @Published var rawPointsByState: [CaptureState: [SIMD3<Float>]] = [:]
 
-    /// Discrete yaw/pitch buckets we’ve visited so far.
-    /// (We’ll use 8 azimuth × 4 elevation bins.)
-    var coverageBins: Set<Int> = []
-
-    /// Prevents multiple auto-stops in one run.
-    var didAutoStopOnCoverage: Bool = false
-
-    // MARK: - Capture targets
-    
-    var targetFrameCount: Int {
-        switch planningMode {
-        case .esthetic: return 80
-        case .fullArch: return 120
-        }
-    }
-    
-    // MARK: - Throttling
-    
-    var frameIndex: Int = 0
-    let visionStride: Int = 3        // run Vision 1/3 frames
-    let previewStride: Int = 4       // rebuild preview 1/4 frames
-    
-    // MARK: - Init
     
     override init() {
         super.init()
+        session.delegateQueue = .main
         session.delegate = self
+        Task { await imageWriter.clearSessionFolder(state: .smile) }
     }
     
-    func arSession() -> ARSession { session }
+    // MARK: - Lifecycle & Camera Switching
     
-    // MARK: - Public control
+    func toggleCamera() {
+        useFrontCamera.toggle()
+        stop()
+        // Small delay to allow session to tear down before restarting
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            self.start()
+        }
+    }
     
     func start() {
-        rawPointsByState[captureState] = []
-        facePointsByState[captureState] = []
-
-        frameCountForState = 0
-        lastCaptureTimestamp = 0
-        lastTextureImage = nil
-
-        referenceCameraTransform = nil
-        referenceCameraInverse  = nil
-
-        faceLockAcquired     = false
-        consecutiveFaceHits  = 0
-        lastDetection        = nil
-
-        highDetailStatus           = ""
-        isHighDetailReconstructing = false
-        highDetailModelURL         = nil
-
-        previewScene    = nil
-        previewGeometry = nil
-
-        // NEW: reset coverage meter
-        resetCoverage()
-
-        imageWriter.clearSessionFolder(state: captureState)
-
-        let config = ARWorldTrackingConfiguration()
-        config.isLightEstimationEnabled = true
-        config.environmentTexturing    = .none
-        config.frameSemantics          = []
-
-        // If you’re using the video-resolution preset extension, apply it here:
-        // applyVideoResolutionPreset(arVideoResolution, to: config)
-
+        // 1. CHOOSE CONFIGURATION
+        let config: ARConfiguration
+        
+        if useFrontCamera {
+            // --- SELFIE MODE ---
+            guard ARFaceTrackingConfiguration.isSupported else {
+                statusText = "Face ID not available"
+                return
+            }
+            let faceConfig = ARFaceTrackingConfiguration()
+            faceConfig.isLightEstimationEnabled = true
+            
+            // Try to find best resolution for Front Camera
+            if let best = ARFaceTrackingConfiguration.supportedVideoFormats.max(by: {
+                $0.imageResolution.height < $1.imageResolution.height
+            }) {
+                faceConfig.videoFormat = best
+            }
+            
+            config = faceConfig
+            statusText = "Selfie Mode"
+            
+        } else {
+            // --- REAR CAMERA (HIGH RES) ---
+            guard ARWorldTrackingConfiguration.isSupported else {
+                statusText = "AR not supported"
+                return
+            }
+            let worldConfig = ARWorldTrackingConfiguration()
+            worldConfig.isAutoFocusEnabled = true
+            
+            // Force 4K Resolution (3840x2160 usually)
+            if let best = ARWorldTrackingConfiguration.supportedVideoFormats.max(by: {
+                ($0.imageResolution.width * $0.imageResolution.height) <
+                ($1.imageResolution.width * $1.imageResolution.height)
+            }) {
+                worldConfig.videoFormat = best
+                print("Rear Camera: \(best.imageResolution)")
+            }
+            
+            config = worldConfig
+            statusText = "Rear 4K Mode"
+        }
+        
+        // 2. RUN
         session.run(config, options: [.resetTracking, .removeExistingAnchors])
-
-        isRunning  = true
-        statusText = "Align patient face in view"
+        isRunning = true
+        
+        // Reset counters
+        referenceCameraTransform = nil
     }
-
-
-
-    
     
     func stop() {
         session.pause()
         isRunning = false
-        setTorch(enabled: false)
-        statusText = "Scan stopped"
+        statusText = "Paused"
     }
     
-    func resetStateSamples() {
-        rawPointsByState[captureState]  = []
-        facePointsByState[captureState] = []
-        frameCountForState              = 0
-        lastCaptureTimestamp            = 0
-        lastTextureImage                = nil
-
-        referenceCameraTransform = nil
-        referenceCameraInverse  = nil
-
-        faceLockAcquired    = false
-        consecutiveFaceHits = 0
-        lastDetection       = nil
-
-        highDetailStatus           = ""
-        isHighDetailReconstructing = false
-        highDetailModelURL         = nil
-
-        previewScene    = nil
-        previewGeometry = nil
-
-        // NEW: reset coverage meter
-        resetCoverage()
-
-        imageWriter.clearSessionFolder(state: captureState)
-        statusText = "Reset \(captureState.rawValue)"
+    func restart() {
+        stop()
+        resetState()
+        Task { await imageWriter.clearSessionFolder(state: captureState) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.start() }
     }
     
-    // MARK: - Manual shutter entry point (for UI)
-    
-    /// Called from the camera-circle button in ScanView when in Manual mode.
-    /// It does **not** block the UI; the next good AR frame will be stored
-    /// by the capture pipeline (`processFrame` in ARScanManager+Capture.swift).
- 
-    
-    // MARK: - Torch
-    
-    func setTorch(enabled: Bool) {
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera,
-                                                   for: .video,
-                                                   position: .back),
-              device.hasTorch else {
-            isTorchOn = false
-            return
-        }
-        
-        do {
-            try device.lockForConfiguration()
-            if enabled {
-                if device.torchMode != .on {
-                    try device.setTorchModeOn(level: AVCaptureDevice.maxAvailableTorchLevel)
-                }
-            } else {
-                if device.torchMode != .off {
-                    device.torchMode = .off
-                }
-            }
-            device.unlockForConfiguration()
-            isTorchOn = enabled
-        } catch {
-            isTorchOn = (device.torchMode == .on)
-        }
-    }
-    func cancelHighDetailReconstruction(deleteCaptures: Bool) {
-        // Cancel the long-running task & session if they exist
-        currentPhotogrammetrySession?.cancel()
-        currentPhotogrammetryTask?.cancel()
-
-        currentPhotogrammetrySession = nil
-        currentPhotogrammetryTask = nil
-
-        isHighDetailReconstructing = false
-        highDetailStatus = "Photogrammetry cancelled"
-        statusText = highDetailStatus
-
-        if deleteCaptures {
-            // Wipe images for the *current* capture state
-            imageWriter.clearSessionFolder(state: captureState)
-            frameCountForState = 0
-            lastTextureImage = nil
-        }
-
-        // Optional: also clear preview
+    func resetState() {
+        frameCountForState = 0
+        statusText = "Ready to Scan"
         previewScene = nil
-        previewGeometry = nil
         highDetailModelURL = nil
+        isHighDetailReconstructing = false
+        lastTextureImage = nil
+        
+        // Reset tracking vars
+        facePointsByState.removeAll()
+        rawPointsByState.removeAll()
+        referenceCameraInverse = nil
+        referenceCameraTransform = nil
+        coverageBins.removeAll()
+        azimuthProgress = 0
+        elevationProgress = 0
+        didAutoStopOnCoverage = false
     }
-    
 }

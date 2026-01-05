@@ -1,61 +1,74 @@
-// ARScanManager+Export.swift
+// FILE: qlone/ARScanManager+Export.swift
+import Foundation
 import SceneKit
 import ModelIO
+import SceneKit.ModelIO
+
+// MARK: - Export Extension
 
 extension ARScanManager {
     
-    // MARK: - Export preview mesh
-    
-    func exportPreviewMesh(format: MeshExportFormat) -> URL? {
-        var geometries: [SCNGeometry] = []
+    /// Prepare raw images for AirDrop
+    func prepareRawDataForExport() async -> URL? {
+        let fileManager = FileManager.default
+        let sourceURL = await imageWriter.sessionFolder(state: captureState)
         
-        if let g = previewGeometry {
-            geometries.append(g)
+        // Validation
+        var isDir: ObjCBool = false
+        guard fileManager.fileExists(atPath: sourceURL.path, isDirectory: &isDir), isDir.boolValue else {
+            statusText = "Export Error: Source missing."
+            return nil
         }
-        if let scene = previewScene {
-            collectGeometries(from: scene.rootNode, into: &geometries)
+        
+        // Staging
+        let tempDir = fileManager.temporaryDirectory
+        let targetName = "DentalScan_\(captureState.rawValue.capitalized)_Data"
+        let targetURL = tempDir.appendingPathComponent(targetName)
+        
+        try? fileManager.removeItem(at: targetURL)
+        
+        do {
+            try fileManager.copyItem(at: sourceURL, to: targetURL)
+            statusText = "Ready to Share"
+            return targetURL
+        } catch {
+            statusText = "Export Failed: \(error.localizedDescription)"
+            return nil
         }
-        guard !geometries.isEmpty else {
-            statusText = "No mesh in preview to export yet."
+    }
+    
+    /// Export mesh to STL/OBJ
+    func exportPreviewMesh(format: MeshExportFormat) -> URL? {
+        guard let scene = previewScene else {
+            statusText = "No mesh to export."
             return nil
         }
         
         let tempDir = FileManager.default.temporaryDirectory
-        
-        let ext: String
-        switch format {
-        case .obj: ext = "obj"
-        case .ply: ext = "ply"
-        case .stl: ext = "stl"
-        }
-        
-        let url = tempDir.appendingPathComponent("face_preview.\(ext)")
-        
+        let fileName = "dental_scan_ios_proxy"
+        let url = tempDir.appendingPathComponent("\(fileName).\(format.fileExtension)")
         let asset = MDLAsset()
-        for g in geometries {
-            let mdlMesh = MDLMesh(scnGeometry: g)
-            asset.add(mdlMesh)
+        
+        scene.rootNode.enumerateChildNodes { node, _ in
+            if let geometry = node.geometry {
+                let mdlMesh = MDLMesh(scnGeometry: geometry)
+                if format == .stl {
+                    let scale: Float = 1000.0 // mm
+                    let transform = matrix_float4x4(diagonal: SIMD4<Float>(scale, scale, scale, 1))
+                    mdlMesh.transform = MDLTransform(matrix: transform)
+                }
+                asset.add(mdlMesh)
+            }
         }
+        
+        if asset.count == 0 { return nil }
         
         do {
             try asset.export(to: url)
-            statusText = "Exported \(ext.uppercased())"
             return url
         } catch {
-            statusText = "Export failed: \(error.localizedDescription)"
+            statusText = "Export failed."
             return nil
         }
     }
-    
-    // MARK: - Geometry helpers
-    
-    func collectGeometries(from node: SCNNode, into array: inout [SCNGeometry]) {
-        if let g = node.geometry {
-            array.append(g)
-        }
-        for child in node.childNodes {
-            collectGeometries(from: child, into: &array)
-        }
-    }
 }
-

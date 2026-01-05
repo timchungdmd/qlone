@@ -27,14 +27,20 @@ enum PlanningMode: String, CaseIterable, Codable {
     }
 }
 
+// MARK: - Capture Mode (MISSING PIECE)
+
+enum CaptureMode: String, CaseIterable, Codable {
+    case auto
+    case manual
+}
+
 // MARK: - Capture state & preview mode
 
 enum CaptureState: String, CaseIterable {
     case repose
     case smile
     case profile
-    // ...
-    case teethMacro      // <-- add this
+    case teethMacro
 }
 
 
