@@ -5,6 +5,11 @@ import SceneKit
 struct ScanView: View {
     @ObservedObject var scanManager: ARScanManager
     
+    // Alert state for overwriting data
+    @State private var showDeleteConfirmation = false
+    // NEW: Alert state for the Reset/Trash button
+    @State private var showResetConfirmation = false
+    
     var body: some View {
         ZStack {
             // 1. Camera Feed
@@ -52,8 +57,11 @@ struct ScanView: View {
                 
                 // --- BOTTOM CONTROLS ---
                 HStack(spacing: 30) {
-                    // RESET
-                    Button(action: { scanManager.restart() }) {
+                    // RESET (Trash Can)
+                    Button(action: {
+                        // Ask for confirmation before deleting everything
+                        showResetConfirmation = true
+                    }) {
                         Image(systemName: "trash")
                             .font(.title)
                             .padding()
@@ -62,12 +70,20 @@ struct ScanView: View {
                             .foregroundColor(.white)
                     }
                     
-                    // CAPTURE (Start/Stop)
+                    // CAPTURE (Start/Stop) with Confirmation Logic
                     Button(action: {
                         if scanManager.isRunning {
+                            // If running, simply stop
                             scanManager.stop()
                         } else {
-                            scanManager.start()
+                            // If stopped, check if we have existing data
+                            if scanManager.frameCountForState > 0 {
+                                // Ask for confirmation before overwriting
+                                showDeleteConfirmation = true
+                            } else {
+                                // No data, start immediately
+                                scanManager.start()
+                            }
                         }
                     }) {
                         Image(systemName: scanManager.isRunning ? "stop.circle.fill" : "circle.inset.filled")
@@ -89,6 +105,29 @@ struct ScanView: View {
                 }
                 .padding(.bottom, 40)
             }
+        }
+        // Stop scanning when navigating away
+        .onDisappear {
+            scanManager.stop()
+        }
+        // ALERT 1: Start New Scan (Overwrite)
+        .alert("Start New Scan?", isPresented: $showDeleteConfirmation) {
+            Button("Cancel", role: .cancel) { }
+            Button("Delete & Start", role: .destructive) {
+                scanManager.restart()
+            }
+        } message: {
+            Text("This will delete your previous scan data and start a new session.")
+        }
+        // ALERT 2: Reset Data (Trash Button)
+        .alert("Delete Scan Data?", isPresented: $showResetConfirmation) {
+            Button("Cancel", role: .cancel) { }
+            Button("Delete", role: .destructive) {
+                // Clears data but DOES NOT start scanning
+                scanManager.resetAndIdle()
+            }
+        } message: {
+            Text("Are you sure? This will permanently delete all photos and mesh data.")
         }
     }
 }

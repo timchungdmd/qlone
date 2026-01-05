@@ -13,11 +13,10 @@ extension ARScanManager {
         Task {
             let captureFolder = await imageWriter.sessionFolder(state: captureState)
             
-            // 1. Find HEIC images (Changed from JPG)
+            // 1. Find JPEG images (Fixes read errors)
             let allFiles = (try? fm.contentsOfDirectory(at: captureFolder, includingPropertiesForKeys: nil)) ?? []
-            let imageFiles = allFiles.filter { $0.pathExtension.lowercased() == "heic" }
+            let imageFiles = allFiles.filter { $0.pathExtension.lowercased() == "jpeg" || $0.pathExtension.lowercased() == "jpg" }
             
-            // Check minimum count (10+)
             guard imageFiles.count >= 10 else {
                 await MainActor.run {
                     self.highDetailStatus = "Need more photos (10+)"
@@ -37,29 +36,15 @@ extension ARScanManager {
                 self.statusText = self.highDetailStatus
             }
             
-            // 3. Copy Images & Depth Files
+            // 3. Copy Images
             let sortedImages = imageFiles.sorted { $0.lastPathComponent < $1.lastPathComponent }
-            
-            // Limit to 150 to prevent memory crashes
             let maxCount = 150
             let selection = sortedImages.count > maxCount ? Array(sortedImages.prefix(maxCount)) : sortedImages
             
             for (i, url) in selection.enumerated() {
-                // Standardize name: img_0000.heic
                 let newBaseName = "img_\(String(format: "%04d", i))"
-                
-                // Copy Color
-                let destImage = inputFolder.appendingPathComponent("\(newBaseName).heic")
+                let destImage = inputFolder.appendingPathComponent("\(newBaseName).jpeg")
                 try? fm.copyItem(at: url, to: destImage)
-                
-                // Copy Depth TIFF (Check for matching depth file)
-                let originalBase = url.deletingPathExtension().lastPathComponent
-                let originalDepth = captureFolder.appendingPathComponent("\(originalBase)_depth.tiff")
-                
-                if fm.fileExists(atPath: originalDepth.path) {
-                    let destDepth = inputFolder.appendingPathComponent("\(newBaseName)_depth.tiff")
-                    try? fm.copyItem(at: originalDepth, to: destDepth)
-                }
             }
             
             // 4. Run Photogrammetry
@@ -73,13 +58,11 @@ extension ARScanManager {
             
             do {
                 var config = PhotogrammetrySession.Configuration()
-                // Disable object masking to utilize the full depth data
-                config.isObjectMaskingEnabled = false
+                config.isObjectMaskingEnabled = true // Masking ON (using images only for on-device stability)
                 config.sampleOrdering = .unordered
                 config.featureSensitivity = .high
                 
                 let session = try PhotogrammetrySession(input: inputFolder, configuration: config)
-                // Use .reduced for faster on-device processing stability
                 let request = PhotogrammetrySession.Request.modelFile(url: outputURL, detail: .reduced)
                 
                 try session.process(requests: [request])

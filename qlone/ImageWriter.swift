@@ -4,12 +4,12 @@ import CoreImage
 import AVFoundation
 import ImageIO
 import UniformTypeIdentifiers
-import VideoToolbox // Essential for fast CGImage conversion
 
-/// Handles writing HEIC images and Depth data with Metadata.
+/// Handles writing Max-Quality JPEG images and Float32 Depth TIFFs.
 actor ImageWriter {
     
     private let fm = FileManager.default
+    // Use CIContext for robust color/format conversion
     private let context = CIContext(options: [.cacheIntermediates: false])
     
     // MARK: - Paths
@@ -51,7 +51,6 @@ actor ImageWriter {
     
     // MARK: - Writing Logic
     
-    /// Writes image and depth data to disk, preserving ARKit Metadata.
     func write(colorBuffer: CVPixelBuffer,
                metadata: [String: Any]?,
                rawDepthBuffer: CVPixelBuffer?,
@@ -61,46 +60,43 @@ actor ImageWriter {
         let timestamp = Int(Date().timeIntervalSince1970 * 1000)
         let baseFilename = "img_\(timestamp)"
         
-        let imageURL = folder.appendingPathComponent("\(baseFilename).heic")
+        // SWITCH TO JPEG (Fixes "Failed to read sample")
+        let imageURL = folder.appendingPathComponent("\(baseFilename).jpeg")
         
-        // 1. PREPARE METADATA (Critical for Gravity/Orientation)
+        // 1. PREPARE METADATA
         var finalMetadata = metadata ?? [:]
-        // Force Orientation 6 (Right) because ARKit buffers are landscape
         finalMetadata[kCGImagePropertyOrientation as String] = 6
+        // MAX QUALITY (1.0) - effectively lossless for Photogrammetry
+        finalMetadata[kCGImageDestinationLossyCompressionQuality as String] = 1.0
         
-        // 2. WRITE HEIC (Color + Metadata)
-        // Use VideoToolbox for efficient CVPixelBuffer -> CGImage conversion
-        var cgImage: CGImage?
-        VTCreateCGImageFromCVPixelBuffer(colorBuffer, options: nil, imageOut: &cgImage)
+        // 2. WRITE JPEG (Color)
+        // Use CIContext -> CGImage for maximum stability (prevents corrupted writes)
+        let ciImage = CIImage(cvPixelBuffer: colorBuffer)
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
         
-        if let image = cgImage {
-            if let dest = CGImageDestinationCreateWithURL(imageURL as CFURL, UTType.heic.identifier as CFString, 1, nil) {
-                // This injects the Gravity Vector and Orientation
-                CGImageDestinationAddImage(dest, image, finalMetadata as CFDictionary)
+        if let cgImage = context.createCGImage(ciImage, from: ciImage.extent, format: .RGBA8, colorSpace: colorSpace) {
+            if let dest = CGImageDestinationCreateWithURL(imageURL as CFURL, UTType.jpeg.identifier as CFString, 1, nil) {
+                CGImageDestinationAddImage(dest, cgImage, finalMetadata as CFDictionary)
                 if !CGImageDestinationFinalize(dest) {
-                    print("❌ Failed to finalize HEIC")
+                    print("❌ Failed to finalize JPEG")
                 }
             }
         }
         
-        // 3. WRITE DEPTH TIFF (If available)
+        // 3. WRITE DEPTH TIFF (Float32) - "Raw Data" for macOS
         if let depthMap = rawDepthBuffer {
             let depthURL = folder.appendingPathComponent("\(baseFilename)_depth.tiff")
             
-            // Apply Orientation 6 to Depth so it aligns with Color
             let depthImage = CIImage(cvPixelBuffer: depthMap)
                 .settingProperties([kCGImagePropertyOrientation as String : 6])
             
             do {
-                // Use Linear Gray for accurate 16-bit depth values
-                // Safe fallback for ColorSpace
-                let depthColorSpace = CGColorSpace(name: CGColorSpace.linearGray) ?? CGColorSpace(name: CGColorSpace.genericGrayGamma2_2)!
-                
+                // Use Float32 (.Rf) to preserve real-world metric depth
                 try context.writeTIFFRepresentation(
                     of: depthImage,
                     to: depthURL,
-                    format: .L16, // 16-bit Grayscale
-                    colorSpace: depthColorSpace,
+                    format: .Rf,
+                    colorSpace: CGColorSpace(name: CGColorSpace.linearGray)!,
                     options: [:]
                 )
             } catch {

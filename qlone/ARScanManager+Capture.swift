@@ -3,7 +3,7 @@ import SceneKit
 import Foundation
 import UIKit
 import AVFoundation
-import CoreVideo // Required for CMCopyDictionaryOfAttachments
+import CoreVideo
 
 extension ARScanManager {
     
@@ -15,7 +15,6 @@ extension ARScanManager {
         if captureMode == .manual {
             shouldSave = pendingManualCapture
         } else {
-            // Auto Mode: Throttle (0.6s)
             let now = Date().timeIntervalSince1970
             let timeElapsed = (now - lastCaptureTimestamp) > 0.6
             
@@ -32,8 +31,7 @@ extension ARScanManager {
         if shouldSave {
             let colorBuffer = frame.capturedImage
             
-            // EXTRACT METADATA (Gravity, Intrinsics)
-            // This retrieves the hidden "Apple Maker Notes" needed to fix "Sample not registered"
+            // EXTRACT METADATA (Critical for Gravity)
             let metadata = CMCopyDictionaryOfAttachments(
                 allocator: kCFAllocatorDefault,
                 target: colorBuffer,
@@ -44,17 +42,17 @@ extension ARScanManager {
             var rawDepth: CVPixelBuffer? = nil
             
             if useFrontCamera {
-                // Front: Convert Disparity (Inverse) -> Linear Depth (Float32)
+                // Front: Convert Disparity -> Depth
                 if let depthData = frame.capturedDepthData {
                     let converted = depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
                     rawDepth = converted.depthDataMap
                 }
             } else {
-                // Rear: LiDAR SceneDepth is already Linear Depth
+                // Rear: LiDAR SceneDepth
                 rawDepth = frame.sceneDepth?.depthMap
             }
             
-            // Save to Disk
+            // Save to Disk (Color + Depth)
             Task {
                 await imageWriter.write(
                     colorBuffer: colorBuffer,
@@ -69,7 +67,6 @@ extension ARScanManager {
             lastCaptureTimestamp = Date().timeIntervalSince1970
             statusText = pendingManualCapture ? "Captured!" : "Scanning (\(frameCountForState))"
             
-            // Thumbnail
             if frameCountForState % 5 == 0 {
                 self.updatePreviewThumbnail(from: colorBuffer)
             }

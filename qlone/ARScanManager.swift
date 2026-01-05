@@ -76,11 +76,10 @@ class ARScanManager: NSObject, ObservableObject, ARSessionDelegate {
             }
             let faceConfig = ARFaceTrackingConfiguration()
             faceConfig.isLightEstimationEnabled = true
-            // TrueDepth data (capturedDepthData) is available by default in face tracking
             
-            // Try to find best resolution
             if let best = ARFaceTrackingConfiguration.supportedVideoFormats.max(by: {
-                $0.imageResolution.height < $1.imageResolution.height
+                ($0.imageResolution.width * $0.imageResolution.height) <
+                ($1.imageResolution.width * $1.imageResolution.height)
             }) {
                 faceConfig.videoFormat = best
             }
@@ -97,21 +96,16 @@ class ARScanManager: NSObject, ObservableObject, ARSessionDelegate {
             let worldConfig = ARWorldTrackingConfiguration()
             worldConfig.isAutoFocusEnabled = true
             
-            // 1. Force 4K Resolution if available
             if let best = ARWorldTrackingConfiguration.supportedVideoFormats.max(by: {
                 ($0.imageResolution.width * $0.imageResolution.height) <
                 ($1.imageResolution.width * $1.imageResolution.height)
             }) {
                 worldConfig.videoFormat = best
-                print("Rear Camera: \(best.imageResolution)")
             }
             
-            // 2. ENABLE LIDAR DEPTH
+            // Enable LiDAR Depth
             if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
                 worldConfig.frameSemantics.insert(.sceneDepth)
-                // Optional: smoothedSceneDepth fills holes but might blur edges
-                // worldConfig.frameSemantics.insert(.smoothedSceneDepth)
-                print("LiDAR Scene Depth Enabled")
             }
             
             config = worldConfig
@@ -121,8 +115,6 @@ class ARScanManager: NSObject, ObservableObject, ARSessionDelegate {
         // RUN
         session.run(config, options: [.resetTracking, .removeExistingAnchors])
         isRunning = true
-        
-        // Reset counters
         referenceCameraTransform = nil
     }
     
@@ -137,6 +129,14 @@ class ARScanManager: NSObject, ObservableObject, ARSessionDelegate {
         resetState()
         Task { await imageWriter.clearSessionFolder(state: captureState) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.start() }
+    }
+    
+    // NEW: Deletes data but stays in "Neutral/Idle" state
+    func resetAndIdle() {
+        stop()
+        resetState()
+        Task { await imageWriter.clearSessionFolder(state: captureState) }
+        statusText = "Ready. Tap to Scan."
     }
     
     func resetState() {
